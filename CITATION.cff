@@ -1,0 +1,10 @@
+@software{mounirdahmane_2024_11381129,
+  author       = {MounirDahmane},
+  title        = {{MounirDahmane/Quadcopter-design-using-PID-Controller: Init}},
+  month        = may,
+  year         = 2024,
+  publisher    = {Zenodo},
+  version      = {0.1.0},
+  doi          = {10.5281/zenodo.11381129},
+  url          = {https://doi.org/10.5281/zenodo.11381129}
+}
