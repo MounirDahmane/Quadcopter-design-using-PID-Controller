@@ -92,7 +92,7 @@ void RST()
 void IMU_init()
 {
   Wire.begin();
-  byte status = mpu.begin(1, 0);
+  byte status = mpu.begin(1, 2);
   // mpu.upsideDownMounting = true; // uncomment this line if the MPU6050 is mounted upside-down
   Serial.print(F("MPU6050 status: "));
   Serial.println(status);
