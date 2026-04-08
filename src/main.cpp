@@ -1,330 +1,345 @@
+/**
+ * @file main.cpp
+ * @brief Flight controller main loop - orchestrates all subsystems
+ * 
+ * This refactored version separates concerns into dedicated modules:
+ * - imu.h/cpp     : Sensor reading and calibration
+ * - pid.h/cpp     : Stabilization algorithm
+ * - motor.h/cpp   : ESC and motor control
+ * - controller.h/cpp : WiFi communication (unchanged)
+ * 
+ * Main responsibility: coordinate subsystems and execute flight loop
+ * 
+ * Flight Control Flow:
+ * 1. Read IMU sensors
+ * 2. Check WiFi connection and process inputs
+ * 3. Update desired angles from stick input
+ * 4. Calculate PID errors
+ * 5. Compute PID corrections
+ * 6. Mix corrections into motor speeds
+ * 7. Write speeds to ESCs
+ * 8. Update status LED
+ * 
+ * @author [Your Name/Team]
+ * @date 2024
+ */
+
 #include "controller.h"
-#include "Wire.h"
-#include <MPU6050_light.h>
-#include <ESP32Servo.h>
+#include "imu.h"
+#include "pid.h"
+#include "motor.h"
 
-#define LED_BUILTIN 2 // multiple LEDs can be used for different info, i just used the built-in one with different ways
-MPU6050 mpu(Wire);
+// ============================================================================
+// HARDWARE CONFIGURATION
+// ============================================================================
 
-float angle_x = 0, angle_y = 0, angle_z = 0;
+#define LED_BUILTIN 2 ///< LED pin for status indication
 
-#define MAX_SIGNAL 2000.0
-#define MIN_SIGNAL 1000.0
-#define Throttle   1000.0
+// ============================================================================
+// FLIGHT STATE
+// ============================================================================
 
-#define MOTOR_PIN1 15 //front right
-#define MOTOR_PIN2 23 //back right
-#define MOTOR_PIN3 4  //front left
-#define MOTOR_PIN4 16 //back left
+/// Overall armed state (true = motors running, false = motors idle)
+static bool armed = false;
 
-Servo motor1; 
-Servo motor2; 
-Servo motor3; 
-Servo motor4; 
-                      // PID = e.Kp + ∫e.Ki + Δe.Kd
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
 
-enum {ROLL, PITCH, YAW};
-// PID coefficients: roll, pitch, yaw
-float Kp[3] = {0.93, 0.93, 55.0};     
-float Ki[3] = {0.03, 0.035, 0.0};    
-float Kd[3] = {3.0, 0.0, 0.0};        
-
-int   esc1_speed = 1000, esc2_speed = 1000, esc3_speed = 1000, esc4_speed = 1000;
-float roll_desired = 0, pitch_desired = 0, yaw_desired = 0;
-float errors[3] = {0, 0, 0}, prev_error[3] = {0, 0, 0}, error_sum[3] = {0, 0, 0}, error_dt[3] = {0, 0, 0};
-
-float roll_pid = 0, pitch_pid = 0, yaw_pid = 0;
-float X_error=0, Y_error=0, Z_error=0;
-
-bool armed = false;
-
-unsigned long prev_time = 0;
-float dt = 0.004;
-
-const float alpha = 0.15;
-
-void minmax(float& var, float maxVal, float minVal)
+/**
+ * @brief Update desired angles from stick input and apply smoothing
+ * 
+ * Maps RC stick values (1000-2000 microseconds) to angle commands (-10 to +10°)
+ * and applies exponential smoothing to prevent jerky movements.
+ * 
+ * @param stick_roll Current roll stick position
+ * @param stick_pitch Current pitch stick position
+ * 
+ * @note Applies deadband filter to reject stick noise
+ */
+static void update_desired_angles(int stick_roll, int stick_pitch)
 {
-  if (var > maxVal)  var = maxVal;
-  if (var < minVal)  var = minVal;
-}
-void minmax(int& var, int maxVal, int minVal)
-{
-  if (var > maxVal)  var = maxVal;
-  if (var < minVal)  var = minVal;
-}
-void RST()
-{
-  esc1_speed = 1000;
-  esc2_speed = 1000;
-  esc3_speed = 1000;
-  esc4_speed = 1000;
+  // Map stick inputs (1000-2000 µs) to angle commands (-10 to +10°)
+  float roll_target  = mapFloat(stick_roll,  MIN_SIGNAL, MAX_SIGNAL, -10.0, 10.0);
+  float pitch_target = mapFloat(stick_pitch, MIN_SIGNAL, MAX_SIGNAL, -10.0, 10.0);
 
-  motor1.writeMicroseconds(esc1_speed);
-  motor2.writeMicroseconds(esc2_speed);
-  motor3.writeMicroseconds(esc3_speed);
-  motor4.writeMicroseconds(esc4_speed);
-
-  for(int i=0; i<3; i++)
-  {
-    prev_error[i] = 0;
-    error_dt  [i] = 0;
-    errors    [i] = 0;
-    error_sum [i] = 0;
-  }
-  roll_pid = 0;
-  pitch_pid = 0;
-  yaw_pid = 0;
-  angle_x = 0;
-  angle_y = 0;
-  angle_z = 0;
-  
-  //  to prevent "carryover" drift after disarming.
-  roll_desired = 0;
-  pitch_desired = 0;
-  yaw_desired = 0;
-
-  digitalWrite(LED_BUILTIN, LOW);
-  mpu.update();
-}
- 
-
-void IMU_init()
-{
-  Wire.begin();
-  byte status = mpu.begin(1, 2);
-  // mpu.upsideDownMounting = true; // uncomment this line if the MPU6050 is mounted upside-down
-  Serial.print(F("MPU6050 status: "));
-  Serial.println(status);
-  while (status != 0) {} // stop everything if could not connect to MPU6050 
-  delay(100);
-
-  // Enables DLPF
-  Wire.beginTransmission(0x68); 
-  Wire.write(0x1A);             
-  Wire.write(0x01);             
-  Wire.endTransmission();  
-
-  mpu.calcOffsets(); // gyro and accelero offset calculation for calibration
-  mpu.setFilterGyroCoef(0.98);
-}
-void get_angle()
-{
-  mpu.update();
-  
-  angle_x = mpu.getAngleX() ;//- X_error; // for calibration() if used
-  angle_y = mpu.getAngleY() ;//- Y_error; // for calibration() if used
-  angle_z = mpu.getAngleZ() ;//- Z_error; // for calibration() if used
-}
-void calibration()
-{ 
-  X_error = 0;  Y_error = 0;  Z_error = 0;
-  for(int i = 0; i< 3000; i++)
-  {
-    float X = mpu.getAngleX(); // reading the high and low gyro data, by or op and shift op 
-    float Y = mpu.getAngleY();
-    float Z = mpu.getAngleZ();
-
-    X_error += X ;
-    Y_error += Y ;
-    Z_error += Z ;
-  }
-  
-  X_error /= 3000;
-  Y_error /= 3000;
-  Z_error /= 3000;
-}
-
-void calculate_errors()
-{
-    // Calculate current errors
-  errors[ROLL]  = angle_x - roll_desired;
-  errors[PITCH] = angle_y - pitch_desired;
-  errors[YAW]   = angle_z - yaw_desired;
-
-  unsigned long now = millis();
-  dt = (now - prev_time) / 1000.0;
-  prev_time = now;
-
-    // Calculate sum of errors : Integral coefficients
-  error_sum[ROLL]  += errors[ROLL]  * dt;
-  error_sum[PITCH] += errors[PITCH] * dt;
-  error_sum[YAW]   += errors[YAW]   * dt;
-
-    // Keep values in acceptable range to prevent windup effect
-  minmax(error_sum[ROLL], 400, -400);
-  minmax(error_sum[PITCH], 400, -400);
-  minmax(error_sum[YAW], 400, -400);
-
-  if(controller.roll < 1200)
-    error_sum[ROLL] = 0;
-  if(controller.pitch < 1200)
-    error_sum[PITCH] = 0; 
-    // Calculate error delta : Derivative coefficients
-  error_dt[ROLL]  = (errors[ROLL]  - prev_error[ROLL])  / dt;
-  error_dt[PITCH] = (errors[PITCH] - prev_error[PITCH]) / dt;
-  error_dt[YAW]   = (errors[YAW]   - prev_error[YAW])   / dt;
-    // Save current error as previous_error for next time
-  
-  prev_error[PITCH] = errors[PITCH];
-  prev_error[ROLL] = errors[ROLL];
-  prev_error[YAW] = errors[YAW];
-
-}
-void PID() {
-  if(armed)
-  {
-    
-    roll_pid  = (Kp[ROLL]  * errors[ROLL])  + (Ki[ROLL]  * error_sum[ROLL])  + (Kd[ROLL]  * error_dt[ROLL]) ;
-    pitch_pid = (Kp[PITCH] * errors[PITCH]) + (Ki[PITCH] * error_sum[PITCH]) + (Kd[PITCH] * error_dt[PITCH]);
-    yaw_pid   = (Kp[YAW]   * errors[YAW])   + (Ki[YAW]   * error_sum[YAW])   + (Kd[YAW]   * error_dt[YAW])  ;
-
-    minmax(roll_pid,  400, -400);
-    minmax(pitch_pid, 400, -400);
-    minmax(yaw_pid,   400, -400);
-
-    esc1_speed = controller.throtle - roll_pid + pitch_pid +  yaw_pid;  //15 front right
-    esc2_speed = controller.throtle + roll_pid + pitch_pid -  yaw_pid;  //23 back right
-    esc3_speed = controller.throtle - roll_pid - pitch_pid -  yaw_pid;  //4  front left
-    esc4_speed = controller.throtle + roll_pid - pitch_pid +  yaw_pid;  //16 back left
-
-    // Prevent out-of-range-values
-    minmax(esc1_speed, 1800, 1050);
-    minmax(esc2_speed, 1800, 1050);
-    minmax(esc3_speed, 1800, 1050);
-    minmax(esc4_speed, 1800, 1050);
-  }
-  else
-  {
-   RST();
-  }
-}
-
-void motor_init()
-{
-  motor1.attach(MOTOR_PIN1, MIN_SIGNAL, MAX_SIGNAL);
-  motor2.attach(MOTOR_PIN2, MIN_SIGNAL, MAX_SIGNAL);
-  motor3.attach(MOTOR_PIN3, MIN_SIGNAL, MAX_SIGNAL);
-  motor4.attach(MOTOR_PIN4, MIN_SIGNAL, MAX_SIGNAL);
-
-  delay(20);
-
-  motor1.writeMicroseconds(MIN_SIGNAL); 
-  motor2.writeMicroseconds(MIN_SIGNAL);
-  motor3.writeMicroseconds(MIN_SIGNAL); 
-  motor4.writeMicroseconds(MIN_SIGNAL);
-  
-  delay(20);
-}
-void brushless_speed()
-{
-  motor1.writeMicroseconds(esc1_speed);
-  motor2.writeMicroseconds(esc2_speed);
-  motor3.writeMicroseconds(esc3_speed);
-  motor4.writeMicroseconds(esc4_speed);
-}
-void esc_calibration()
-{
-  motor1.writeMicroseconds(MAX_SIGNAL);
-  motor2.writeMicroseconds(MAX_SIGNAL);
-  motor3.writeMicroseconds(MAX_SIGNAL);
-  motor4.writeMicroseconds(MAX_SIGNAL);
-  
-  delay(2000);
-
-  motor1.writeMicroseconds(MIN_SIGNAL);
-  motor2.writeMicroseconds(MIN_SIGNAL);
-  motor3.writeMicroseconds(MIN_SIGNAL);
-  motor4.writeMicroseconds(MIN_SIGNAL);
-
-  delay(20);
-}
-void INFO()
-{
-  Serial.print(controller.throtle);Serial.print("\t");
-  Serial.print(angle_x);Serial.print("\t");Serial.print(angle_y);Serial.print("\t");Serial.print(angle_z);
-  Serial.print("\t ROLL : ");Serial.print(roll_pid);Serial.print("\t PITCH : ");Serial.print(pitch_pid);Serial.print("\t YAW : ");Serial.print(yaw_pid);Serial.print("\t");
-  Serial.print(esc1_speed);Serial.print("\t");Serial.print(esc2_speed);Serial.print("\t");Serial.print(esc3_speed);Serial.print("\t");Serial.print(esc4_speed);Serial.print("\t");
-  Serial.print(X_error);Serial.print("\t");Serial.print(Y_error);Serial.print("\t");Serial.print(Z_error);Serial.print("\n");
- // Serial.print("armed");Serial.print(calibration.armed);Serial.print("\n");
-  delay(100);
-}
-float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-}
-
-
-void setup() {
-
-  Serial.begin(115200);
-  IMU_init();
-  //calibration(); // if calcOffsets() is not enough, uncomment this line to calibrate the IMU
-  motor_init();
-
-  pinMode(LED_BUILTIN, OUTPUT);
-
-  digitalWrite(LED_BUILTIN, HIGH);  // Starting ESC calibration
-  esc_calibration();
-
-  digitalWrite(LED_BUILTIN, LOW);   // ESC calibration done
-  delay(100);
-
-  RST();
-  
-  controller.begin();
-  digitalWrite(LED_BUILTIN, HIGH);  // Finished setup, waiting
-  delay(2000);
-  digitalWrite(LED_BUILTIN, LOW);   // Ready for connectio
-}
-
-void loop() {
-  get_angle(); 
-
-  // Check for single client connection
-  if (WiFi.softAPgetStationNum() != 1) {
-    if (armed) {
-      armed = false;
-      digitalWrite(LED_BUILTIN, LOW);
-      Serial.println("Disarming: multiple or zero clients connected.");
-    }
-    RST(); 
-    return;  
-  }
-
-  controller.loop();
-  minmax(controller.throtle, MAX_SIGNAL, MIN_SIGNAL);
-
-  if(controller.armed >= 1500) 
-    armed = true; 
-  else if(controller.armed < 1500) 
-    armed = false;
-  
-  if (!armed)
-    for (int i = 0; i < 3; i++) error_sum[i] = 0;
-
-  float roll_target  = mapFloat(controller.roll, MIN_SIGNAL, MAX_SIGNAL, -10.0, 10.0);
-  float pitch_target = mapFloat(controller.pitch, MIN_SIGNAL, MAX_SIGNAL, -10.0, 10.0);
-
-  // Exponential smoothing
+  // Apply exponential smoothing to desired angles
+  // Prevents jerky, rapid angle changes
+  // alpha = 0.15 means new_desired = 0.85*old + 0.15*target
   roll_desired  = roll_desired  * (1.0 - alpha) + roll_target  * alpha;
   pitch_desired = pitch_desired * (1.0 - alpha) + pitch_target * alpha;
 
-
-  // Prevent small values from causing drift: A deadband filter
-  if (abs(roll_desired) < 1.0) roll_desired = 0;
+  // Apply deadband filter: small stick inputs are ignored
+  // Prevents drift from stick noise/centering errors
+  if (abs(roll_desired) < 1.0)  roll_desired = 0;
   if (abs(pitch_desired) < 1.0) pitch_desired = 0;
+}
 
-  calculate_errors();
-  PID();
-  brushless_speed();
-
-static unsigned long lastBlink = 0;
-if (!armed) {// Blinking LED when disarmed
-  if (millis() - lastBlink > 500) {
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-    lastBlink = millis();
+/**
+ * @brief Update armed state from control input
+ * 
+ * Convention: aux1 >= 1500 = armed, < 1500 = disarmed
+ * 
+ * @param armed_input Input value from controller
+ */
+static void update_armed_state(int armed_input)
+{
+  if (armed_input >= 1500) {
+    armed = true;
+    digitalWrite(LED_BUILTIN, HIGH); // Solid LED when armed
+  } 
+  else {
+    armed = false;
+    // LED blink will be handled in main loop
   }
-} 
-else
-  digitalWrite(LED_BUILTIN, HIGH); // solid when armed
+}
+
+/**
+ * @brief Update LED status indicator
+ * 
+ * Flashing LED = disarmed (safe)
+ * Solid LED = armed (motors running)
+ */
+static void update_led_status()
+{
+  static unsigned long lastBlink = 0;
+  
+  if (!armed) {
+    // Blink LED every 500ms when disarmed
+    if (millis() - lastBlink > 500) {
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      lastBlink = millis();
+    }
+  } 
+  else {
+    // Solid LED when armed (set above in update_armed_state)
+    digitalWrite(LED_BUILTIN, HIGH);
+  }
+}
+
+/**
+ * @brief Full system reset/disarm
+ * 
+ * Called when disarming or on error condition.
+ * Resets all subsystems to safe state.
+ */
+static void system_reset()
+{
+  armed = false;
+  motor_reset();
+  pid_reset();
+}
+
+// ============================================================================
+// DEBUG OUTPUT
+// ============================================================================
+
+/**
+ * @brief Print flight telemetry over serial for debugging
+ * 
+ * Outputs tab-separated telemetry data at 115200 baud
+ * Update interval: ~100ms
+ */
+static void print_telemetry()
+{
+  Serial.print(throttle);          Serial.print("\t");
+  Serial.print(angle_x);           Serial.print("\t");
+  Serial.print(angle_y);           Serial.print("\t");
+  Serial.print(angle_z);           Serial.print("\t");
+  Serial.print("ROLL:");           Serial.print(roll_pid);  Serial.print("\t");
+  Serial.print("PITCH:");          Serial.print(pitch_pid); Serial.print("\t");
+  Serial.print("YAW:");            Serial.print(yaw_pid);   Serial.print("\t");
+  Serial.print(esc1_speed);        Serial.print("\t");
+  Serial.print(esc2_speed);        Serial.print("\t");
+  Serial.print(esc3_speed);        Serial.print("\t");
+  Serial.print(esc4_speed);        Serial.print("\t");
+  Serial.print(X_error);           Serial.print("\t");
+  Serial.print(Y_error);           Serial.print("\t");
+  Serial.println(Z_error);
+}
+
+// ============================================================================
+// ARDUINO SETUP
+// ============================================================================
+
+/**
+ * @brief Arduino setup function - called once at power-on
+ * 
+ * Initialization sequence:
+ * 1. Start serial communication for debugging
+ * 2. Initialize IMU sensor (MPU6050)
+ * 3. Initialize motors/ESCs
+ * 4. Set up LED status indicator
+ * 5. Perform ESC calibration (requires propellers OFF)
+ * 6. Reset flight state
+ * 7. Initialize WiFi controller
+ * 8. Signal ready status with LED
+ * 
+ * @warning Blocks during ESC calibration (~2.1 seconds with propellers OFF)
+ * @warning Do NOT start propellers during setup
+ */
+void setup() 
+{
+  // Initialize serial communication for debugging output
+  Serial.begin(115200);
+  Serial.println("\n=== Flight Controller Startup ===");
+  
+  // Initialize IMU (MPU6050) sensor
+  Serial.println("Initializing IMU...");
+  IMU_init();
+  Serial.println("✓ IMU initialized");
+  
+  // Optionally perform manual IMU calibration (uncomment if needed)
+  // Takes ~30 seconds; only necessary if auto-calibration is insufficient
+  // Serial.println("Calibrating IMU...");
+  // calibration();
+  // Serial.println("✓ IMU calibration complete");
+  
+  // Initialize motor control pins and set to minimum speed
+  Serial.println("Initializing motors...");
+  motor_init();
+  Serial.println("✓ Motors initialized");
+
+  // Set up LED indicator pin
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  // Perform ESC calibration
+  Serial.println("Calibrating ESCs (propellers OFF!)...");
+  digitalWrite(LED_BUILTIN, HIGH);  // LED on = calibration in progress
+  esc_calibration();                // Performs 2-second calibration sequence
+  digitalWrite(LED_BUILTIN, LOW);   // LED off = calibration done
+  Serial.println("✓ ESC calibration complete");
+  delay(100);
+
+  // Reset all flight state variables
+  system_reset();
+  Serial.println("✓ System reset");
+  
+  // Initialize WiFi controller and HTTP server
+  Serial.println("Starting WiFi...");
+  controller.begin();
+  Serial.println("✓ WiFi server started");
+  
+  // Signal ready status
+  Serial.println("\n=== System Ready ===");
+  Serial.println("SSID: ESP32");
+  Serial.println("IP: 192.168.0.1");
+  Serial.println("Endpoint: /control");
+  digitalWrite(LED_BUILTIN, HIGH);  // LED on = ready, waiting for commands
+  delay(2000);
+  digitalWrite(LED_BUILTIN, LOW);   // LED off = ready to fly
+  Serial.println("Awaiting control input...\n");
+}
+
+// ============================================================================
+// ARDUINO MAIN LOOP
+// ============================================================================
+
+/**
+ * @brief Arduino main loop - called repeatedly at maximum speed
+ * 
+ * Flight Control Loop (target frequency: >100Hz):
+ * 
+ * 1. Read IMU orientation
+ * 2. Check WiFi connection status (must have exactly 1 client)
+ * 3. Process WiFi control inputs
+ * 4. Update armed state from control input
+ * 5. Update desired angles from stick input
+ * 6. Calculate PID errors
+ * 7. Compute PID corrections
+ * 8. Mix corrections into motor speeds
+ * 9. Write corrected motor speeds to ESCs
+ * 10. Update status LED
+ * 
+ * Safety Features:
+ * - Auto-disarms if WiFi disconnected
+ * - Auto-disarms if more than one client connected
+ * - Clamps all values to safe ranges
+ * - Resets integral term when stick is centered
+ * 
+ * @note Runs as fast as the ESP32 can execute (~1kHz typical)
+ * @note Actual PID loop frequency depends on execution time (~100-200Hz typical)
+ */
+void loop() 
+{
+  // ========== SENSOR INPUT ==========
+  
+  // Step 1: Read current orientation from IMU
+  get_angle();
+
+  // ========== SAFETY CHECKS ==========
+  
+  // Step 2: Check WiFi connection status
+  // For safety: only allow operation with exactly 1 connected client
+  if (WiFi.softAPgetStationNum() != 1) {
+    // Multiple or zero clients connected: auto-disarm
+    if (armed) {
+      Serial.println("⚠ Disarming: WiFi client count != 1");
+    }
+    system_reset();
+    return; // Exit early, don't process flight control
+  }
+
+  // ========== CONTROL INPUT ==========
+  
+  // Step 3: Update controller (process WiFi input and HTTP requests)
+  controller.loop();
+  
+  // Clamp throttle to valid range
+  minmax(throttle, (int)MAX_SIGNAL, (int)MIN_SIGNAL);
+
+  // Step 4: Update armed state from control input
+  update_armed_state(controller.armed);
+  
+  // Step 5: Reset integral errors when disarmed (prevents windup)
+  if (!armed) {
+    for (int i = 0; i < 3; i++) {
+      error_sum[i] = 0;
+    }
+  }
+
+  // ========== CONTROL SETPOINT ==========
+  
+  // Step 6: Update desired angles from stick input with smoothing
+  update_desired_angles(controller.roll, controller.pitch);
+
+  // ========== PID CONTROL ==========
+  
+  // Step 7: Calculate PID error terms
+  calculate_errors(angle_x, angle_y, angle_z, armed, 
+                   controller.roll, controller.pitch);
+  
+  // Step 8: Compute PID corrections
+  if (armed) {
+    compute_pid();
+  } else {
+    // Clear PID outputs when disarmed
+    roll_pid = 0;
+    pitch_pid = 0;
+    yaw_pid = 0;
+  }
+  
+  // ========== MOTOR CONTROL ==========
+  
+  // Step 9: Mix PID corrections into motor speeds
+  motor_mix(controller.throtle, roll_pid, pitch_pid, yaw_pid);
+  
+  // Step 10: Write corrected motor speeds to ESCs
+  write_motors();
+
+  // ========== STATUS INDICATION ==========
+  
+  // Step 11: Update LED status indicator
+  update_led_status();
+  
+  // ========== DEBUG OUTPUT ==========
+  
+  // Optional: Print telemetry every ~100ms
+  // Uncomment to enable serial output for debugging
+  // static unsigned long lastPrint = 0;
+  // if (millis() - lastPrint > 100) {
+  //   print_telemetry();
+  //   lastPrint = millis();
+  // }
 }
